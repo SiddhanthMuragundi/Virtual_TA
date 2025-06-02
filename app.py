@@ -17,6 +17,7 @@ import uvicorn
 import traceback
 from dotenv import load_dotenv
 
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -388,44 +389,53 @@ async def enrich_with_adjacent_chunks(conn, results):
         raise
 
 # Function to generate an answer using LLM with improved prompt
-async def generate_answer(question, relevant_results, max_retries=2):
+async def generate_answer(question, context_or_results, max_retries=2):
     if not API_KEY:
         error_msg = "API_KEY environment variable not set"
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
-    
+
     retries = 0
-    while retries < max_retries:    
+    while retries < max_retries:
         try:
             logger.info(f"Generating answer for question: '{question[:50]}...'")
-            context = ""
-            for result in relevant_results:
-                source_type = "Discourse post" if result["source"] == "discourse" else "Documentation"
-                context += f"\n\n{source_type} (URL: {result['url']}):\n{result['content'][:1500]}"
-            
-            # Prepare improved prompt
+
+            # If context_or_results is a list (old), build context string; else assume string
+            if isinstance(context_or_results, list):
+                context = ""
+                for result in context_or_results:
+                    source_type = "Discourse post" if result["source"] == "discourse" else "Documentation"
+                    context += f"\n\n{source_type} (URL: {result['url']}):\n{result['content'][:1500]}"
+            else:
+                context = context_or_results
+
+            # Optional summarization if context too long
+            if len(context) > 4000:
+                logger.info("Context too long, summarizing before answering")
+                context = await summarize_text(context)
+
             prompt = f"""Answer the following question based ONLY on the provided context. 
-            If you cannot answer the question based on the context, say "I don't have enough information to answer this question."
-            
-            Context:
-            {context}
-            
-            Question: {question}
-            
-            Return your response in this exact format:
-            1. A comprehensive yet concise answer
-            2. A "Sources:" section that lists the URLs and relevant text snippets you used to answer
-            
-            Sources must be in this exact format:
-            Sources:
-            1. URL: [exact_url_1], Text: [brief quote or description]
-            2. URL: [exact_url_2], Text: [brief quote or description]
-            
-            Make sure the URLs are copied exactly from the context without any changes.
-            """
-            
+If you cannot answer the question based on the context, say "I don't have enough information to answer this question."
+
+Context:
+{context}
+
+Question: {question}
+
+Return your response in this exact format:
+1. A comprehensive yet concise answer
+2. A "Sources:" section that lists the URLs and relevant text snippets you used to answer
+
+Sources must be in this exact format:
+Sources:
+1. URL: [exact_url_1], Text: [brief quote or description]
+2. URL: [exact_url_2], Text: [brief quote or description]
+
+Make sure the URLs are copied exactly from the context without any changes.
+"""
+
             logger.info("Sending request to LLM API")
-            # Call OpenAI API through aipipe proxy
+
             url = "https://aipipe.org/openai/v1/chat/completions"
             headers = {
                 "Authorization": API_KEY,
@@ -437,25 +447,26 @@ async def generate_answer(question, relevant_results, max_retries=2):
                     {"role": "system", "content": "You are a helpful assistant that provides accurate answers based only on the provided context. Always include sources in your response with exact URLs."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.3  # Lower temperature for more deterministic outputs
+                "temperature": 0.3
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=payload) as response:
                     if response.status == 200:
                         result = await response.json()
                         logger.info("Successfully received answer from LLM")
                         return result["choices"][0]["message"]["content"]
-                    elif response.status == 429:  # Rate limit error
+                    elif response.status == 429:
                         error_text = await response.text()
                         logger.warning(f"Rate limit reached, retrying after delay (retry {retries+1}): {error_text}")
-                        await asyncio.sleep(3 * (retries + 1))  # Exponential backoff
+                        await asyncio.sleep(3 * (retries + 1))
                         retries += 1
                     else:
                         error_text = await response.text()
                         error_msg = f"Error generating answer (status {response.status}): {error_text}"
                         logger.error(error_msg)
                         raise HTTPException(status_code=response.status, detail=error_msg)
+
         except Exception as e:
             error_msg = f"Exception generating answer: {e}"
             logger.error(error_msg)
@@ -463,7 +474,8 @@ async def generate_answer(question, relevant_results, max_retries=2):
             retries += 1
             if retries >= max_retries:
                 raise HTTPException(status_code=500, detail=error_msg)
-            await asyncio.sleep(2)  # Wait before retry
+            await asyncio.sleep(2)
+
 
 # Function to process multimodal content (text + image)
 async def process_multimodal_query(question, image_base64):
@@ -595,94 +607,119 @@ def parse_llm_response(response):
             "links": []
         }
 
+
+
+
+
+def build_semantic_chain(enriched_results):
+    # Combine contents separated by two newlines for clarity
+    texts = [res["content"] for res in enriched_results]
+    return "\n\n".join(texts)
+
+async def summarize_text(text):
+    # Basic summarization call to OpenAI - you can improve this
+    url = "https://aipipe.org/openai/v1/chat/completions"
+    headers = {
+        "Authorization": API_KEY,
+        "Content-Type": "application/json"
+    }
+    prompt = f"Summarize the following text concisely:\n\n{text}"
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 300
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            if response.status == 200:
+                result = await response.json()
+                return result["choices"][0]["message"]["content"]
+            else:
+                return text  # fallback if summarization fails
+
+
 # Define API routes
 @app.post("/query")
 async def query_knowledge_base(request: QueryRequest):
     try:
-        # Log the incoming request
         logger.info(f"Received query request: question='{request.question[:50]}...', image_provided={request.image is not None}")
-        
+
         if not API_KEY:
             error_msg = "API_KEY environment variable not set"
             logger.error(error_msg)
-            return JSONResponse(
-                status_code=500,
-                content={"error": error_msg}
-            )
-            
+            return JSONResponse(status_code=500, content={"error": error_msg})
+
         conn = get_db_connection()
-        
+
         try:
             # Process the query (handle text and optional image)
             logger.info("Processing query and generating embedding")
-            query_embedding = await process_multimodal_query(
-                request.question,
-                request.image
-            )
-            
+            query_embedding = await process_multimodal_query(request.question, request.image)
+
             # Find similar content
             logger.info("Finding similar content")
             relevant_results = await find_similar_content(query_embedding, conn)
-            
+
             if not relevant_results:
                 logger.info("No relevant results found")
                 return {
                     "answer": "I couldn't find any relevant information in my knowledge base.",
                     "links": []
                 }
-            
-            # Enrich results with adjacent chunks for better context
-            logger.info("Enriching results with adjacent chunks")
+
+            # --- Rerank retrieved results by semantic similarity to question ---
+            relevant_results = rerank_results_by_semantic_similarity(request.question, relevant_results)
+
+            # --- Enrich results with adjacent chunks for better context ---
             enriched_results = await enrich_with_adjacent_chunks(conn, relevant_results)
-            
-            # Generate answer
-            logger.info("Generating answer")
-            llm_response = await generate_answer(request.question, enriched_results)
-            
+
+            # --- Build semantic chain (combined text of enriched chunks) ---
+            semantic_chain_text = build_semantic_chain(enriched_results)
+
+            # --- Generate answer using semantic chain text as context ---
+            llm_response = await generate_answer(request.question, semantic_chain_text)
+
             # Parse the response
             logger.info("Parsing LLM response")
             result = parse_llm_response(llm_response)
-            
+
             # If links extraction failed, create them from the relevant results
             if not result["links"]:
                 logger.info("No links extracted, creating from relevant results")
-                # Create a dict to deduplicate links from the same source
                 links = []
                 unique_urls = set()
-                
+
                 for res in relevant_results[:5]:  # Use top 5 results
                     url = res["url"]
                     if url not in unique_urls:
                         unique_urls.add(url)
                         snippet = res["content"][:100] + "..." if len(res["content"]) > 100 else res["content"]
                         links.append({"url": url, "text": snippet})
-                
+
                 result["links"] = links
-            
-            # Log the final result structure (without full content for brevity)
+
             logger.info(f"Returning result: answer_length={len(result['answer'])}, num_links={len(result['links'])}")
-            
-            # Return the response in the exact format required
+
             return result
+
         except Exception as e:
             error_msg = f"Error processing query: {e}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
-            return JSONResponse(
-                status_code=500,
-                content={"error": error_msg}
-            )
+            return JSONResponse(status_code=500, content={"error": error_msg})
+
         finally:
             conn.close()
+
     except Exception as e:
-        # Catch any exceptions at the top level
         error_msg = f"Unhandled exception in query_knowledge_base: {e}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"error": error_msg}
-        )
+        return JSONResponse(status_code=500, content={"error": error_msg})
+
 
 # Health check endpoint
 @app.get("/health")
